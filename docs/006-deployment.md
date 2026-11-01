@@ -156,7 +156,7 @@ scripts\dsh-superagent.cmd status
 
 `start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. On Windows it starts the same command in a hidden console instead of tmux. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
 
-`stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. On Windows the runner sends a Ctrl+C console event to the service's hidden console and waits for the DSH process to exit. Neither script force-kills the process, and neither touches other tmux sessions.
+`stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. On Windows the runner sends a Ctrl+C console event to the console that owns the service; if `launcher.pid` is missing or stale, it locates the owning shell from the process tree and from any matching `cmd.exe`, so losing that file does not block a graceful stop. A stale lock left by a force-killed DSH (for example `%USERPROFILE%\.dsh\state\superagent.lock`, beside the state directory rather than inside it) does not block the next `start`: once no service for the profile runs, the runner removes it and says so. Set `DSH_SUPERAGENT_STATE_ROOT` if the profile's state lives somewhere other than `%USERPROFILE%\.dsh\state`. Neither script force-kills the process, and neither touches other tmux sessions.
 
 `status` prints process ids, health and setup problems. For a different profile or port, use `--profile` and `--url`, or set `DSH_SUPERAGENT_PROFILE` and `DSH_SUPERAGENT_URL`.
 
@@ -176,7 +176,7 @@ A Source that is still starting counts as normal operation. So does a Feishu bot
 Each profile stores logs and control files under `.artifacts/`:
 
 - Startup logs: `dsh-superagent-<profile>-<date>-<time>-<pid>.log`, where the pid belongs to the script. The newest 20 are kept.
-- Control files: `control/profiles/<profile>/`, containing the stop marker, lock and process id. On Windows they also contain `launcher.pid`, the hidden `cmd` process that owns the service's console; the runner removes it when it stops the service.
+- Control files: `control/profiles/<profile>/`, containing the stop marker, lock and process id. On Windows they also contain `launcher.pid`, the hidden `cmd` process that owns the service's console; the runner refreshes it from the process tree at start and removes it when it stops the service.
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
 

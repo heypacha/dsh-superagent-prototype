@@ -59,6 +59,8 @@ function serviceEnv(): NodeJS.ProcessEnv {
   env[pathKey] = join(root, 'bin') + ';' + (env[pathKey] ?? '')
   env.DSH_SUPERAGENT_PROFILE = PROFILE
   env.DSH_SUPERAGENT_URL = ''
+  // Keep stale-lock cleanup away from the real %USERPROFILE%\.dsh\state during tests.
+  env.DSH_SUPERAGENT_STATE_ROOT = join(root, 'state')
   return env
 }
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -310,6 +312,25 @@ describe.runIf(process.platform === 'win32')('the Windows service script', () =>
       closeSync(descriptor)
     }
     expect((await run('status')).stderr).not.toContain('Another dsh-superagent control operation is in progress')
+  }, 60_000)
+  it('removes a stale state lock left by a force-killed process before starting', async () => {
+    const url = await answering()
+    const lock = join(root, 'state', PROFILE + '.lock')
+    mkdirSync(lock, { recursive: true })
+    writeFileSync(join(lock, 'stale'), '')
+    const started = await run('start', '--url', url, '--timeout', '20')
+    expect(started.code).toBe(0)
+    expect(existsSync(lock)).toBe(false)
+  }, 60_000)
+  it('stops through the service\'s parent shell when launcher.pid is stale', async () => {
+    const url = await answering()
+    expect((await run('start', '--url', url, '--timeout', '20')).code).toBe(0)
+    const pid = readPidFile('service.pid')
+    writeFileSync(join(control(), 'launcher.pid'), '999999' + CRLF)
+    const stopped = await run('stop', '--stop-timeout', '20')
+    expect(stopped.code).toBe(0)
+    expect(isAlive(pid)).toBe(false)
+    expect(existsSync(join(control(), 'launcher.pid'))).toBe(false)
   }, 60_000)
   it('serves the same commands through the .cmd wrapper', async () => {
     const listed = await runWrapper('status')

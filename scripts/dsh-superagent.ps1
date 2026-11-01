@@ -307,6 +307,67 @@ function Get-DshProcesses([string]$Profile) {
   return $found.ToArray()
 }
 
+# The console-owning shell for a service: its nearest ancestor cmd.exe that launched this profile with --no-open.
+function Get-LauncherCandidate([int]$ServiceId, [string]$Profile) {
+  $current = $ServiceId
+  for ($depth = 0; $depth -lt 4; $depth++) {
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $current" -ErrorAction SilentlyContinue
+    if (-not $process) { return 0 }
+    $parent = [int]$process.ParentProcessId
+    if ($parent -le 0) { return 0 }
+    $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $parent" -ErrorAction SilentlyContinue
+    if (-not $candidate) { return 0 }
+    if ($candidate.Name -eq 'cmd.exe' -and $candidate.CommandLine -and $candidate.CommandLine.Contains('--no-open') -and (Test-DshServiceCommand $candidate.CommandLine $Profile)) { return $parent }
+    $current = $parent
+  }
+  return 0
+}
+# The recorded launcher pid if it still is this profile's launcher shell.
+function Get-RecordedLauncher([string]$Profile) {
+  $launcherPid = Read-PidFile (Get-ControlFile $Profile 'launcher.pid')
+  if (-not $launcherPid) { return 0 }
+  $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $launcherPid" -ErrorAction SilentlyContinue
+  if ($candidate -and $candidate.Name -eq 'cmd.exe' -and $candidate.CommandLine -and $candidate.CommandLine.Contains('--no-open') -and (Test-DshServiceCommand $candidate.CommandLine $Profile)) { return $launcherPid }
+  return 0
+}
+# Every cmd.exe shell that launched this profile with --no-open, for when launcher.pid was lost or corrupted.
+function Get-LauncherShells([string]$Profile) {
+  $found = New-Object System.Collections.Generic.List[int]
+  try { $scanned = @(Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction Stop) } catch { $scanned = @() }
+  foreach ($process in $scanned) {
+    if ($process.CommandLine -and $process.CommandLine.Contains('--no-open') -and (Test-DshServiceCommand $process.CommandLine $Profile)) {
+      $processId = [int]$process.ProcessId
+      if (-not $found.Contains($processId)) { $found.Add($processId) }
+    }
+  }
+  return $found.ToArray()
+}
+# Ordered console targets for a graceful stop: recorded shell, the service's parent shell, any matching shell, then the service itself.
+function Get-ConsoleTargets([int]$ServiceId, [string]$Profile) {
+  $targets = New-Object System.Collections.Generic.List[int]
+  foreach ($candidate in @(@(Get-RecordedLauncher $Profile) + @(Get-LauncherCandidate $ServiceId $Profile) + @(Get-LauncherShells $Profile) + @($ServiceId))) {
+    if ($candidate -gt 0 -and -not $targets.Contains($candidate)) { $targets.Add($candidate) }
+  }
+  return $targets.ToArray()
+}
+# State root that holds the proper-lockfile lock beside a profile's state directory (override for tests/custom layouts).
+function Get-StateRoot {
+  if ($env:DSH_SUPERAGENT_STATE_ROOT) { return $env:DSH_SUPERAGENT_STATE_ROOT }
+  return (Join-Path $env:USERPROFILE '.dsh\state')
+}
+# Remove a stale state lock left by a force-killed process, when no service for the profile is running.
+function Remove-StaleStateLock([string]$Profile) {
+  $lock = Join-Path (Get-StateRoot) ($Profile + '.lock')
+  if (-not [System.IO.Directory]::Exists($lock)) { return }
+  if (@(Get-DshProcesses $Profile).Count -gt 0) { return }
+  try {
+    [System.IO.Directory]::Delete($lock, $true)
+    Write-Line ('Removed stale state lock: ' + $lock)
+  } catch {
+    Write-Line ('Could not remove the stale state lock at ' + $lock + ': ' + $_.Exception.Message)
+  }
+}
+
 function Remove-OldLogs([string]$Profile) {
   if (-not [System.IO.Directory]::Exists($ARTIFACTS)) { return }
   $pattern = '^dsh-superagent-' + [regex]::Escape($Profile) + '-\d{8}-\d{6}-\d+\.log$'
@@ -320,12 +381,10 @@ function Remove-OldLogs([string]$Profile) {
 }
 
 function Remove-RecordedLauncher([string]$Profile) {
-  $launcherPid = Read-PidFile (Get-ControlFile $Profile 'launcher.pid')
-  if (-not $launcherPid) { return }
-  $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $launcherPid" -ErrorAction SilentlyContinue
-  if ($candidate -and $candidate.Name -eq 'cmd.exe' -and $candidate.CommandLine -and $candidate.CommandLine.Contains('--no-open') -and (Test-DshServiceCommand $candidate.CommandLine $Profile)) {
-    Stop-Process -Id $launcherPid -Force -ErrorAction SilentlyContinue
-  }
+  $recorded = Get-RecordedLauncher $Profile
+  $shells = @(Get-LauncherShells $Profile)
+  if ($recorded -gt 0) { $shells += $recorded }
+  foreach ($shell in @($shells | Select-Object -Unique)) { Stop-Process -Id $shell -Force -ErrorAction SilentlyContinue }
 }
 
 $script:ConsoleHelperLoaded = $false
@@ -376,21 +435,14 @@ function Send-ConsoleInterrupt([int]$ProcessId) {
 }
 
 function Request-GracefulStop([string]$Profile, [int]$ProcessId) {
-  $target = $ProcessId
-  $launcher = Read-PidFile (Get-ControlFile $Profile 'launcher.pid')
-  if ($launcher) {
-    $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $launcher" -ErrorAction SilentlyContinue
-    if ($candidate -and $candidate.Name -eq 'cmd.exe' -and $candidate.CommandLine -and $candidate.CommandLine.Contains('--no-open') -and (Test-DshServiceCommand $candidate.CommandLine $Profile)) {
-      $target = $launcher
-    }
+  # The console may belong to a shell other than the recorded one (lost launcher.pid, force-killed launcher), so try
+  # every candidate: recorded shell, the service's parent shell, matching shells, then the service process itself.
+  $targets = @(Get-ConsoleTargets $ProcessId $Profile)
+  foreach ($target in $targets) {
+    if ((Send-ConsoleInterrupt $target) -eq 0) { return }
   }
-  $result = Send-ConsoleInterrupt $target
-  if ($result -ne 0 -and $target -ne $ProcessId) {
-    $result = Send-ConsoleInterrupt $ProcessId
-  }
-  if ($result -ne 0) {
-    throw ("Could not request a graceful shutdown of PID ${ProcessId}: its console could not be reached. No forced kill was sent.")
-  }
+  $tried = if ($targets.Count -gt 0) { $targets -join ', ' } else { 'no console owner found' }
+  throw ("Could not request a graceful shutdown of PID ${ProcessId}: its console could not be reached (tried: ${tried}). No forced kill was sent.")
 }
 
 function Write-Status($Options) {
@@ -425,6 +477,7 @@ function Invoke-Start($Options) {
     throw 'Multiple dsh-superagent processes found; refusing to start another.'
   }
   if ($pids.Count -eq 0) {
+    Remove-StaleStateLock $profile
     # npm installs dsh.ps1, dsh.cmd and an extensionless dsh. Get-Command's default first match is the
     # ExternalScript dsh.ps1, so resolve only Application commands and prefer the cmd/exe/bat shim.
     $command = Get-Command dsh -CommandType Application -All -ErrorAction SilentlyContinue |
@@ -444,7 +497,7 @@ function Invoke-Start($Options) {
     if (-not [System.IO.File]::Exists($commandShell)) { $commandShell = 'cmd.exe' }
     $commandLine = '""' + $source + '" --profile ' + $profile + ' --no-open 1>>"' + $log + '" 2>&1"'
     $launcher = Start-Process -FilePath $commandShell -ArgumentList @('/d', '/s', '/c', $commandLine) -WindowStyle Hidden -PassThru
-    Write-PidFile (Get-ControlFile $profile 'launcher.pid') $launcher.Id
+    if ($launcher -and $launcher.Id) { Write-PidFile (Get-ControlFile $profile 'launcher.pid') $launcher.Id }
     Write-Line ('Log: ' + $log)
   } else {
     Write-PidFile (Get-ControlFile $profile 'service.pid') $pids[0]
@@ -454,7 +507,12 @@ function Invoke-Start($Options) {
   $deadline = (Get-Date).AddSeconds($Options.timeout)
   while ((Get-Date) -lt $deadline) {
     $found = @(Get-DshProcesses $profile)
-    if ($found.Count -gt 0) { Write-PidFile (Get-ControlFile $profile 'service.pid') $found[0] }
+    if ($found.Count -gt 0) {
+      Write-PidFile (Get-ControlFile $profile 'service.pid') $found[0]
+      # Read the console owner from the process tree: Start-Process's id can be stale when the shell was replaced.
+      $owner = Get-LauncherCandidate $found[0] $profile
+      if ($owner -gt 0) { Write-PidFile (Get-ControlFile $profile 'launcher.pid') $owner }
+    }
     $current = Get-OrchestratorState $Options.url
     if ($found.Count -gt 0 -and (Test-RuntimeUp $current)) {
       $code = Write-Status $Options
@@ -475,6 +533,14 @@ function Invoke-Start($Options) {
     Start-Sleep -Seconds 1
   }
   $null = Write-Status $Options
+  $lockHeld = $false
+  if ($log) {
+    try { $lockHeld = [System.IO.File]::ReadAllText($log) -match 'Lock file is already being held' } catch { $lockHeld = $false }
+  }
+  if ($lockHeld) {
+    $lockPath = Join-Path (Get-StateRoot) ($profile + '.lock')
+    throw ('Startup health check timed out because the state lock is held. Stop any leftover dsh-superagent process, delete ' + $lockPath + ', then retry.')
+  }
   throw 'Startup health check timed out; inspect the log. Any running process was left intact.'
 }
 
@@ -541,3 +607,4 @@ try {
   Write-ErrorLine ([string]$_.Exception.Message)
   exit 1
 }
+
