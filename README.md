@@ -16,6 +16,8 @@ Setup has many steps, so an agent does it with you. Ask your coding agent:
 
 It asks one short question at a time, shows the full plan once, and then installs and configures everything. [SETUP.md](SETUP.md) is what it follows.
 
+Setup runs on Linux, macOS and Windows. On Windows the service is managed by `scripts\dsh-superagent.cmd` (Windows PowerShell 5.1, built into Windows 10 and 11) instead of tmux, and the POSIX `scripts/dsh-superagent` script and its Python and tmux prerequisites do not apply.
+
 ## Documentation
 
 Read the numbered documents in order; each builds only on the ones before it.

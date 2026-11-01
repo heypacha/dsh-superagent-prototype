@@ -1024,7 +1024,7 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+    observePulls: false, observeComments: false, observeCi: false, selfRequests: false })
 })
 describe('feishu event consumer', () => {
   let dir: string
@@ -1040,10 +1040,42 @@ describe('feishu event consumer', () => {
     rmSync(dir, { recursive: true, force: true })
   })
   /**
+   * The fake CLI Windows runs: a Node script behind a .cmd wrapper. The consumer spawns the CLI as a real process,
+   * and Windows' CreateProcess cannot start a script, so the wrapper is what makes the fixture a real process too.
+   */
+  function windowsCli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+    writeFileSync(join(dir, 'lark-bot.mjs'), [
+      "import { existsSync, readFileSync, writeFileSync } from 'node:fs'",
+      'const dir = ' + JSON.stringify(dir),
+      'const args = process.argv.slice(2)',
+      'if (args[0] !== "event") { process.stdout.write(JSON.stringify({ ok: true, data: {} }) + String.fromCharCode(10)); process.exit(0) }',
+      'const runs = existsSync(dir + "/runs") ? Number(readFileSync(dir + "/runs", "utf8")) : 0',
+      'writeFileSync(dir + "/runs", String(runs + 1))',
+      'writeFileSync(dir + "/pid", String(process.pid))',
+      'const ready = () => process.stderr.write("[event] ready" + String.fromCharCode(10))',
+      'const stay = () => setInterval(() => {}, 60000)',
+      'const printEvents = () => { process.stdout.write(readFileSync(dir + "/events", "utf8")); writeFileSync(dir + "/printed", "") }',
+      'const mode = ' + JSON.stringify(mode),
+      'switch (mode) {',
+      '  case "never": break',
+      '  case "warn": ready(); process.stderr.write("WARN the connection was reset" + String.fromCharCode(10)); break',
+      '  case "ready": ready(); break',
+      '  case "flaky": ready(); if (runs + 1 > 1) break; process.exit(1)',
+      '  case "events": ready(); printEvents(); break',
+      '  case "late": ready(); setTimeout(printEvents, 1000); break',
+      '}',
+      'stay()',
+    ].join(String.fromCharCode(10)))
+    const path = join(dir, 'lark-bot.cmd')
+    writeFileSync(path, '@echo off' + String.fromCharCode(13, 10) + 'node "%~dp0lark-bot.mjs" %*' + String.fromCharCode(13, 10))
+    return path
+  }
+  /**
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
    * and `flaky` exits after its first ready. It records each run and the PID of the latest.
    */
   function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+    if (process.platform === 'win32') return windowsCli(mode)
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1242,6 +1274,22 @@ describe('observing the GitHub repository', () => {
     observe(h, {})
     await pollRound(h)
     expect(h.store.get('github-stream:issues')).toBeUndefined()
+    h.store.close()
+  })
+  it('takes in the agent\'s own new Issue only with self-requests on and a mention, never its own PR', async () => {
+    const h = host()
+    observe(h, { observeIssues: true, observePulls: true, selfRequests: true })
+    h.store.set('github-since', at(-24))
+    h.store.set('github-stream:issues', { since: at(0), started: { issues: at(0), pulls: at(0) } })
+    const agent = { login: 'agent-bot', type: 'User' }
+    repository(h, { issues: [issue(10, { body: '@agent-bot please fix the typo', user: agent, created_at: at(1), updated_at: at(1) }),
+      { ...issue(11, { body: '@agent-bot a PR', user: agent, created_at: at(2), updated_at: at(2) }), pull_request: { url: 'x' } },
+      issue(12, { body: 'no mention', user: agent, created_at: at(3), updated_at: at(3) })] })
+    await pollRound(h)
+    // The agent's own Issue counts because it mentions the agent, and it is promoted to a human trigger for Policy;
+    // its PR and the unmentioned Issue stay ignored.
+    expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.kind])).toEqual([[10, 'issue']])
+    expect(h.receive.mock.calls[0]![0].human).toBe(true)
     h.store.close()
   })
   it('takes in the repository\'s conversation and review comments, on the Issue or PR each is on', async () => {

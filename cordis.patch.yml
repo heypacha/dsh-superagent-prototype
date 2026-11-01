@@ -21,8 +21,8 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: dsh-superagent-worker
-        name: dsh-superagent 执行器
-        description: dsh-superagent 的执行器 Session 专用，不供手动选择。前台命令超 5 秒转入后台，只含执行工作所需的工具。
+        name: dsh-superagent Executor
+        description: For dsh-superagent Executor Sessions only; not for manual selection. Foreground commands move to a background job after 5 seconds; only the tools execution work needs.
         order: 90
         plugins:
           - id: persona
@@ -126,8 +126,8 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: dsh-superagent-router
-        name: dsh-superagent 主 Session
-        description: dsh-superagent 的主 Session 专用，不供手动选择。前台命令和任务等待超 5 秒转入后台，只含路由所需的工具。
+        name: dsh-superagent Main Session
+        description: For dsh-superagent's main Session only; not for manual selection. Foreground commands and job waits move to a background job after 5 seconds; only the tools routing needs.
         order: 91
         plugins:
           - id: agent-instructions

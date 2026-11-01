@@ -36,7 +36,8 @@ export async function sendGithub(host: Pick<SourceContext, 'commands'>, message:
       && (rootId === undefined || comment.in_reply_to_id === rootId) && (comment.body ?? '').includes(marker)
     if ((await commands.pages(CommentSchema, path)).some(mine)) return 'sent'
     const target = rootId === undefined ? path : `${path}/${rootId}/replies`
-    await commands.api(z.unknown(), target, '--method', 'POST', '-f', `body=${message.text}\n\n${marker}`)
+    // The body goes through stdin: a multi-line argument cannot pass through a Windows .cmd wrapper.
+    await commands.apiBody(z.unknown(), target, { body: `${message.text}\n\n${marker}` })
     return 'sent'
   } catch (error) {
     if (gone(error)) return 'gone'

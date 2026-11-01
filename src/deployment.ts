@@ -1,16 +1,19 @@
 /** Plugin configuration and startup verification for repository access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
 import { accessSync, constants, statSync } from 'node:fs'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
-import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { scrubbedParentEnv, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import { pathEntries, pathVariable, runAsWorker, sameDirectory, unquotePathEntry, withoutDirectory, workerBin } from './infra/environment.ts'
+import { commandScriptArgv, runCommandScript } from './infra/commands.ts'
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+/** A POSIX absolute path, a Windows drive path (C:\... or C:/...), or a UNC path; a relative or ~/ path is refused. */
+const ABSOLUTE_PATH = /^(?:[\\/]|[A-Za-z]:[\\/])/
+const absolute = (description: string) => s.string().pattern(ABSOLUTE_PATH).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -57,10 +60,27 @@ export interface Deployment extends Machine {
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 
-/** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
+/** Extensions Windows resolves a command name with, in the order the OS tries them. */
+const WINDOWS_EXTENSIONS = ['.com', '.exe', '.bat', '.cmd']
+/** The file names a command name can resolve to: on Windows the name with each extension it does not carry yet, elsewhere the name itself. */
+const commandFiles = (name: string, includeBase: boolean): string[] => {
+  if (process.platform !== 'win32') return [name]
+  const lower = name.toLowerCase()
+  const suffixed = WINDOWS_EXTENSIONS.some(extension => lower.endsWith(extension))
+  const files = includeBase || suffixed ? [name] : []
+  return [...files, ...WINDOWS_EXTENSIONS.filter(extension => !lower.endsWith(extension)).map(extension => name + extension)]
+}
+/**
+ * Resolve a command name or absolute path to an executable file, ignoring the worker shim directory.
+ * Windows command names are resolved through PATH and PATHEXT, and PATH directory spellings (case, trailing separator, quotes)
+ * are compared the way the OS compares them.
+ */
 export function executable(name: string, path: string, exclude?: string): string {
-  if (name.includes('/') && !isAbsolute(name)) throw new Error(`${name} must be a command name or an absolute path`)
-  const candidates = isAbsolute(name) ? [name] : path.split(delimiter).filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude))).map(dir => join(dir, name))
+  const separator = process.platform === 'win32' ? /[\\/]/ : /\//
+  if (separator.test(name) && !isAbsolute(name)) throw new Error(`${name} must be a command name or an absolute path`)
+  const candidates = isAbsolute(name) ? commandFiles(name, true) : pathEntries(path).map(unquotePathEntry)
+    .filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude)))
+    .flatMap(dir => commandFiles(name, false).map(file => join(dir, file)))
   for (const candidate of candidates) {
     try { if (statSync(candidate).isFile()) { accessSync(candidate, constants.X_OK); return candidate } }
     catch { /* Not an executable file here; try the next PATH directory. */ }
@@ -68,11 +88,24 @@ export function executable(name: string, path: string, exclude?: string): string
   throw new Error(`${name} is not an executable file${isAbsolute(name) ? '' : ' on PATH'}`)
 }
 
-export type Probe = (argv: string[]) => Promise<string>
-/** Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary. */
+export type Probe = (argv: string[], env?: Record<string, string>) => Promise<string>
+/**
+ * Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script
+ * reaches the real binary. The PATH override travels in the spawn specification's env, whose entries merge onto DSH's scrubbed
+ * parent environment; on Windows the override reuses the parent's PATH spelling.
+ */
 export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal): Probe {
-  const path = withoutDirectory(process.env.PATH ?? '', workerBin(stateDir))
-  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const name = pathVariable()
+  const path = withoutDirectory(process.env[name] ?? '', workerBin(stateDir))
+  return (argv, env) => {
+    const timeout = AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+    // CreateProcess cannot start a Windows batch wrapper, so the DSH subprocess service cannot run a .cmd/.bat CLI.
+    // Probe it through cmd.exe instead, with the same scrubbed environment the service gives its children.
+    if (commandScriptArgv(argv[0] ?? '', argv.slice(1))) {
+      return runCommandScript(argv[0]!, argv.slice(1), { cwd, env: { ...scrubbedParentEnv(), ...env, [name]: path }, signal: timeout })
+    }
+    return runAsWorker(subprocess, argv, cwd, timeout, { ...env, [name]: path })
+  }
 }
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
@@ -84,7 +117,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env[pathVariable()] ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -111,13 +144,13 @@ const BotInfo = z.object({ bot: z.object({ open_id: z.string().regex(/^ou_[A-Za-
  * Verify that the configured Feishu CLI is authenticated as a bot and restricted to strict mode `bot`.
  * Workers invoke this CLI as `lark-cli`, so a CLI that also permits a user identity would let workers act as that user.
  */
-export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<FeishuBot | undefined> {
+export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe: Probe, path = process.env[pathVariable()] ?? ''): Promise<FeishuBot | undefined> {
   const { cli: name } = FeishuBotSchema.parse(feishu ?? {})
   if (!name) return undefined
   const fail = (error: unknown): never => { throw error instanceof SetupError ? error : new SetupError('feishuCliFailed', { output: reason(error) }) }
   let cli = ''
   try { cli = executable(name, path, workerBin(machine.stateDir)) } catch (error) { fail(error) }
-  const run = (...args: string[]): Promise<string> => probe(['env', 'LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1', 'LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1', cli, ...args]).catch(fail)
+  const run = (...args: string[]): Promise<string> => probe([cli, ...args], { LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }).catch(fail)
   const text = await run('auth', 'status')
   const status = parsed(AuthStatus, text.slice(text.indexOf('{')))
   if (!status) return fail(new SetupError('feishuNoApp'))

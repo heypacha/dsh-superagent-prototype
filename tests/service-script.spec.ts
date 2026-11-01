@@ -6,7 +6,10 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, expect, it as vitestIt } from 'vitest'
+
+/** These tests stub POSIX ps, tmux and python3; the Windows runner has its own suite in service-script-windows.spec.ts. */
+const it = (process.platform === 'win32' ? vitestIt.skip : vitestIt) as unknown as typeof vitestIt
 
 let root: string
 let server: Server | undefined
