@@ -180,6 +180,8 @@ Each profile stores logs and control files under `.artifacts/`:
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
 
+On Windows, `scripts\open-superagent-panel.cmd` does both steps: it starts the service first when it is not running, reads the current token URL from the newest log (the token changes on every restart), and opens it in the default browser. The **Superagent Panel** desktop shortcut points at it; pass `-NoOpen` to print the URL instead, or `-Profile`/`-Url` for another profile or port.
+
 ### Hourly check
 
 Create the hourly check in the DeepSeek Harness profile you normally use, not in `superagent`. It must keep running when the agent service is down. Ask an agent in that profile to create an hourly schedule using this prompt, with the checkout path filled in:
