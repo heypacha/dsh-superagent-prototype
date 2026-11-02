@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -249,6 +249,12 @@ it('lists in the same order in SQLite and in memory, and undoes a failed nested 
 it('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
   const path = join(directory, 'state', 'orchestrator.sqlite')
   new Store(path).close()
+  // Windows reports no POSIX permission bits: only the read-only attribute has an effect, so the owner-only modes
+  // cannot be asserted there. The state directory and database must still exist.
+  if (process.platform === 'win32') {
+    expect([existsSync(dirname(path)), existsSync(path)]).toEqual([true, true])
+    return
+  }
   expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
 })
 

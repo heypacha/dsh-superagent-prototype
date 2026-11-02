@@ -6,7 +6,7 @@
     port: 3082
 - id: dsh-superagent
   config:
-    stateDir: <absolute path, for example /home/me/.dsh/state/superagent>
+    stateDir: <absolute path: /home/me/.dsh/state/superagent on Linux or macOS, C:\Users\me\.dsh\state\superagent on Windows>
 # Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
 # - id: dsh-superagent-feishu
 #   disabled: false

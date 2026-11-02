@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { CliError, Commands, commandError, commandScriptArgv } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -9,12 +9,40 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, delimiter, join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
 const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
+const windows = process.platform === 'win32'
+const scratch = mkdtempSync(join(tmpdir(), 'commands-'))
+afterAll(() => rmSync(scratch, { recursive: true, force: true }))
+/** A fresh directory under the test scratch space. */
+function directory(name: string): string { const path = join(scratch, name); mkdirSync(path, { recursive: true }); return path }
+/** A program and arguments that keep running for five seconds, for the abort tests; `sleep` is POSIX-only. */
+const wait = (): [string, string[]] => windows ? [process.execPath, ['-e', 'setTimeout(() => {}, 5000)']] : ['sleep', ['5']]
+/** A program and arguments that print one line, for the test that runs other work while a command runs. */
+const still = (): [string, string[]] => windows ? [process.execPath, ['-e', "console.log('still')"]] : ['echo', ['still']]
+/** True while the process with this id is running. */
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
+/**
+ * A Windows CLI wrapper: a .cmd file around a Node script, the only way Windows can run a CLI written as a script.
+ * Its name may contain spaces, percent signs and ampersands, which the command line must quote.
+ */
+function wrapper(name: string, script: string): string {
+  const path = join(directory(name), name + '.cmd')
+  // The .cmd hard-codes the script path: a wrapper interpolating its own %~dp0 would let a path containing an
+  // ampersand split its own command line, which says nothing about the command line Commands.run builds.
+  const runner = join(directory(name), name + '.mjs')
+  writeFileSync(runner, script)
+  writeFileSync(path, '@echo off\r\nnode "' + runner.replaceAll('%', '%%') + '" %*\r\n')
+  return path
+}
 describe('account-isolated operations', () => {
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
@@ -24,7 +52,11 @@ describe('account-isolated operations', () => {
   it('runs every command with its environment over the process environment, where undefined removes a variable', async () => {
     process.env.GH_TOKEN = 'personal'
     try {
-      const output = await new Commands(() => deployment, { GH_TOKEN: undefined, DSH_SUPERAGENT_PROBE: 'agent' }, new AbortController().signal).run('env', [])
+      const printer: [string, string[]] = windows
+        ? [process.execPath, ['-e', 'for (const [name, value] of Object.entries(process.env)) console.log(name + \'=\' + value)']]
+        : ['env', []]
+      const output = await new Commands(() => deployment, { GH_TOKEN: undefined, DSH_SUPERAGENT_PROBE: 'agent' }, new AbortController().signal)
+        .run(printer[0], [...printer[1]])
       expect(output).toContain('DSH_SUPERAGENT_PROBE=agent')
       expect(output).not.toContain('GH_TOKEN=')
     } finally { delete process.env.GH_TOKEN }
@@ -40,10 +72,11 @@ describe('account-isolated operations', () => {
   })
   it('posts the reply as the model wrote it, only to the fixed repository', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
-    const gh = vi.spyOn(commands,'gh').mockResolvedValue({})
+    const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
     await send(commands, reply)
-    // The disclosure line is prompt text: the model writes it, and the host adds nothing.
-    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\n<!-- dsh-superagent:stable-operation -->$/)])
+    // The disclosure line is prompt text: the model writes it, and the host adds nothing. The body travels on stdin.
+    expect(run).toHaveBeenCalledWith('/path/agent-gh', ['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','--input','-'], undefined,
+      JSON.stringify({ body: 'Done\n\n<!-- dsh-superagent:stable-operation -->' }))
     await expect(new Commands(() => deployment, {}, new AbortController().signal).pages(z.unknown(),
       '../../someone/else/issues')).rejects.toThrow()
   })
@@ -51,7 +84,7 @@ describe('account-isolated operations', () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
     const gh = vi.spyOn(commands,'gh').mockResolvedValueOnce({ id: 7, in_reply_to_id: 3 }).mockResolvedValueOnce({})
     await send(commands, { ...reply, channel: githubChannel(8, `https://github.com/${REPOSITORY}/pull/8#discussion_r7`) })
-    expect(gh.mock.calls[1]![0]).toEqual(['api', `repos/${REPOSITORY}/pulls/8/comments/3/replies`, '--method', 'POST', '-f', expect.stringContaining('Done')])
+    expect(gh.mock.calls[1]![0]).toEqual(['api', `repos/${REPOSITORY}/pulls/8/comments/3/replies`, '--method', 'POST', '--input', '-'])
   })
   it('uses Feishu bot identity and one idempotency key on retries', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{"ok":true,"data":{}}')
@@ -110,7 +143,7 @@ describe('Channels', () => {
       .mockRejectedValueOnce(commandError({ stderr: 'gh: Not Found (HTTP 404)', code: 1 })).mockResolvedValueOnce({})
     expect(await send(value, { ...reply, channel: githubChannel(8, `https://github.com/${REPOSITORY}/pull/8#discussion_r7`) })).toBe('sent')
     expect((pages.mock.calls[0] as unknown[])[1]).toBe('issues/8/comments')
-    const post = ['api', `repos/${REPOSITORY}/issues/8/comments`, '--method', 'POST', '-f', expect.stringContaining('Done')]
+    const post = ['api', `repos/${REPOSITORY}/issues/8/comments`, '--method', 'POST', '--input', '-']
     expect(gh.mock.calls[1]![0]).toEqual(post)
   })
   it('link each address to its page with its label', () => {
@@ -172,9 +205,19 @@ it('says how to add the bot to a chat when Feishu answers that it is not a membe
 it('names only the program and how it ended when a command prints no diagnostics, never its arguments', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const secret = 'secret reply text'
-  await expect(commands.run('sh', ['-c', 'exit 3', secret])).rejects.toMatchObject({ message: 'sh exited with code 3', exitCode: 3 })
-  await expect(commands.run('sh', ['-c', 'kill -9 $$', secret])).rejects.toMatchObject({ message: 'sh was stopped by SIGKILL' })
-  await expect(commands.run('/no/such/program', ['secret reply text'])).rejects.toMatchObject({ message: 'program could not run: ENOENT' })
+  if (windows) {
+    // CreateProcess cannot signal a batch file, so the Windows fake reports exit statuses and never a signal.
+    const fail = join(directory('exits'), 'sh.cmd')
+    writeFileSync(fail, '@exit /b 3\r\n')
+    await expect(commands.run(fail, [secret])).rejects.toMatchObject({ message: 'sh.cmd exited with code 3', exitCode: 3 })
+    writeFileSync(fail, '@exit /b 137\r\n')
+    await expect(commands.run(fail, [secret])).rejects.toMatchObject({ message: 'sh.cmd exited with code 137' })
+  } else {
+    await expect(commands.run('sh', ['-c', 'exit 3', secret])).rejects.toMatchObject({ message: 'sh exited with code 3', exitCode: 3 })
+    await expect(commands.run('sh', ['-c', 'kill -9 $$', secret])).rejects.toMatchObject({ message: 'sh was stopped by SIGKILL' })
+  }
+  const missing = windows ? join(directory('missing'), 'program') : '/no/such/program'
+  await expect(commands.run(missing, ['secret reply text'])).rejects.toMatchObject({ message: 'program could not run: ENOENT' })
   // Timeouts kill the child with SIGTERM; Node's default error message would echo every argument.
   const timedOut = { killed: true, signal: 'SIGTERM', code: null, stderr: '',
     message: 'Command failed: /path/lark-bot im +messages-reply --markdown withdrawn' }
@@ -191,7 +234,8 @@ it('reports failures as CliError with the code the CLI names and the exit status
   const aborted = Object.assign(new Error('The operation was aborted'), { name: 'AbortError', stderr: '' })
   expect(commandError(aborted)).toBe(aborted)
   const controller = new AbortController()
-  const running = new Commands(() => deployment, {}, controller.signal).run('sleep', ['5'])
+  const [sleeper, sleeperArgs] = wait()
+  const running = new Commands(() => deployment, {}, controller.signal).run(sleeper, sleeperArgs)
   controller.abort()
   await expect(running).rejects.toMatchObject({ name: 'AbortError' })
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
@@ -202,14 +246,77 @@ it('reports failures as CliError with the code the CLI names and the exit status
 it('stops a running command when the signal of its work aborts, or the lifetime, and leaves the other work running', async () => {
   const lifetime = new AbortController(), work = new AbortController()
   const commands = new Commands(() => deployment, {}, lifetime.signal)
+  const [sleeper, sleeperArgs] = wait()
+  const [echo, echoArgs] = still()
   const started = Date.now()
-  const running = commands.withSignal(work.signal).run('sleep', ['5'])
+  const running = commands.withSignal(work.signal).run(sleeper, sleeperArgs)
   work.abort()
   await expect(running).rejects.toThrow()
   // Only commands bound to the aborted work signal stop.
-  expect(await commands.run('echo', ['still'])).toBe('still\n')
-  const other = commands.withSignal(new AbortController().signal).run('sleep', ['5'])
+  expect(await commands.run(echo, echoArgs)).toBe('still\n')
+  const other = commands.withSignal(new AbortController().signal).run(sleeper, sleeperArgs)
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+
+it('builds cmd.exe argv only for a batch program that exists', () => {
+  expect(commandScriptArgv(process.execPath, ['api', 'user'])).toBeUndefined()
+  expect(commandScriptArgv('dsh-superagent-missing-cli', [])).toBeUndefined()
+})
+describe.skipIf(!windows)('Windows command scripts', () => {
+  it('runs a .cmd wrapper with escaped arguments, without letting metacharacters reach cmd.exe', async () => {
+    const cli = wrapper('args 100%&x', 'import { writeFileSync } from "node:fs"' + String.fromCharCode(10) +
+      'writeFileSync(process.env.COMMANDS_ARGS, JSON.stringify(process.argv.slice(2)))' + String.fromCharCode(10))
+    const marker = join(dirname(cli), 'INJECTED')
+    const args = ['plain', 'a b', 'a"b', 'a"&calc', '&calc', 'c&d', 'e|f', 'g<h>i', 'j^k', '(l)', '100%', '%PATH%', 'a%PATH%b',
+      'x!y', 'q\\', 's t\\', 'üñí 你好', '', ' lead', 'trail ', 'C:\\a b\\', 'a\\"b', '{"container_id":"oc_1","start_time":"123"}',
+      '& echo INJECTED > "' + marker + '"']
+    const output = join(scratch, 'args.json')
+    const commands = new Commands(() => deployment, { COMMANDS_ARGS: output }, new AbortController().signal)
+    await commands.run(cli, args)
+    expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual(args)
+    expect(existsSync(marker)).toBe(false)
+  })
+  it('reports the exit status and the HTTP code a .cmd wrapper writes', async () => {
+    const cli = wrapper('fails', 'process.stderr.write("gh: Not Found (HTTP 404)' + String.fromCharCode(92) + 'n")' + String.fromCharCode(10) +
+      'process.exit(3)' + String.fromCharCode(10))
+    await expect(new Commands(() => deployment, {}, new AbortController().signal).run(cli, []))
+      .rejects.toMatchObject({ message: 'gh: Not Found (HTTP 404)', code: 404, exitCode: 3 })
+  })
+  it('kills a .cmd wrapper and the program it launched when the command is aborted', async () => {
+    const pidFile = join(scratch, 'abort-pid')
+    const cli = wrapper('slow', 'import { writeFileSync } from "node:fs"' + String.fromCharCode(10) +
+      'writeFileSync(process.env.COMMANDS_PID, String(process.pid))' + String.fromCharCode(10) +
+      'setInterval(() => {}, 60000)' + String.fromCharCode(10))
+    const controller = new AbortController()
+    const commands = new Commands(() => deployment, { COMMANDS_PID: pidFile }, controller.signal)
+    const outcome = commands.run(cli, []).then(() => undefined, (error: unknown) => error)
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 10_000 })
+    controller.abort()
+    expect(await outcome).toMatchObject({ name: 'AbortError' })
+    await vi.waitFor(() => expect(alive(Number(readFileSync(pidFile, 'utf8')))).toBe(false), { timeout: 10_000 })
+  })
+  it('builds the cmd.exe argv another subprocess service can run unchanged', () => {
+    const cli = wrapper('argv 100%', 'import { writeFileSync } from "node:fs"' + String.fromCharCode(10) +
+      'writeFileSync(process.env.COMMANDS_ARGS, JSON.stringify(process.argv.slice(2)))' + String.fromCharCode(10))
+    const args = ['a b', '&calc', '100%', 'a"b', 'üñí 你好', '']
+    const argv = commandScriptArgv(cli, args)
+    expect(argv?.[0]).toBe(process.env.ComSpec || 'cmd.exe')
+    expect(argv?.slice(1, 5)).toEqual(['/d', '/v:off', '/s', '/c'])
+    const output = join(scratch, 'argv.json')
+    const result = spawnSync(argv![0]!, argv!.slice(1), { windowsVerbatimArguments: true,
+      env: { ...process.env, COMMANDS_ARGS: output }, timeout: 20_000 })
+    expect(result.status).toBe(0)
+    expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual(args)
+  })
+  it('recognizes a .bat script and a batch program found on PATH', () => {
+    expect(commandScriptArgv(join(scratch, 'not-created.bat'), [])?.slice(1, 4)).toEqual(['/d', '/v:off', '/s'])
+    const bin = directory('path probe')
+    writeFileSync(join(bin, 'dsh-probe-cli.cmd'), '@exit /b 0' + String.fromCharCode(13, 10))
+    const previous = process.env.PATH
+    process.env.PATH = bin + delimiter + (previous ?? '')
+    try { expect(commandScriptArgv('dsh-probe-cli', [])?.[0]).toBe(process.env.ComSpec || 'cmd.exe') }
+    finally { process.env.PATH = previous }
+  })
 })

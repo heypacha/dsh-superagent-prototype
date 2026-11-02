@@ -25,7 +25,9 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false) }).strict()
+  observeCi: z.boolean().default(false),
+  /** Single-account deployments: let a new Issue the agent account creates itself count when it mentions the agent. */
+  selfRequests: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
 type Scope = keyof typeof OBSERVED
@@ -53,6 +55,8 @@ export const githubKind: SourceKind<GithubConfig> = {
       hint: { zh: '打开后，没有 @ 智能体的新 PR 也会收到，由策略的接收表决定是否成为候选。', en: 'New pull requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'selfRequests', type: 'switch', advanced: true, label: { zh: '接收智能体账号自己新建并 @ 智能体的 Issue', en: 'Receive new Issues the agent account creates itself and that mention it' },
+      hint: { zh: '单账号部署用：打开后，智能体账号自己新建、并且 @ 了智能体的 Issue 也算请求；它自己的 PR 和评论仍被忽略，避免自我循环。默认关闭。', en: 'For single-account deployments: when on, a new Issue created by the agent account itself counts as a request if it mentions the agent. Its own pull requests and comments stay ignored, so it cannot re-trigger itself. Off by default.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
       hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
@@ -224,15 +228,23 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   for (const item of items) {
     // Stopping mid-stream aborts before advancing the cursor so unread items are retried.
     if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
-    if (sameName(item.user.login, login)) continue
+    const own = sameName(item.user.login, login)
     if (id === 'issues') {
       const issue = IssueSchema.safeParse(item)
-      const pr = issue.success && !!issue.data.pull_request
-      if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
-      await ctx.receive(pr ? pullTrigger(issue.data, login) : issueTrigger(issue.data, login))
+      if (!issue.success) continue
+      const pr = !!issue.data.pull_request
+      const trigger = pr ? pullTrigger(issue.data, login) : issueTrigger(issue.data, login)
+      // A single-account deployment may treat the agent's own new Issue as a request when it explicitly mentions the
+      // agent. The agent account is normally a machine actor, so the self-request is promoted to a human trigger for
+      // Policy; its own pull requests stay ignored, so the PR it opens never re-triggers the Source.
+      const self = own && config.selfRequests && !pr && !!trigger.addressed
+      if (own && !self) continue
+      if (!fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
+      await ctx.receive(self ? { ...trigger, human: true } : trigger)
       nameThread(ctx, issue.data.number, issue.data.title)
       continue
     }
+    if (own) continue
     const number = Number(/\/(?:issues|pulls)\/(\d+)$/.exec((id === 'comments' ? item.issue_url : item.pull_request_url) ?? '')?.[1])
     if (!number || !fresh(item.updated_at ?? item.created_at, 'comments')) continue
     const isPr = id === 'review-comments' || /\/pull\//.test(item.html_url ?? '')
